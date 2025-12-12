@@ -1,1 +1,23 @@
-__pycache__
+__pycache__/
+
+# Python venv
+env/
+
+# Local input/output data
+input/
+outputs/
+
+# Logs
+slurm-*.out
+
+# Archives
+*.zip
+*.npz
+
+# Root-level images and 3D assets
+/*.png
+/*.jpg
+/*.jpeg
+/*.gif
+/*.webp
+*.ply
