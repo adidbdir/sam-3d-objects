@@ -120,10 +120,10 @@ class Inference:
             None,
             seed,
             stage1_only=False,
-            with_mesh_postprocess=False,
-            with_texture_baking=False,
+            with_mesh_postprocess=True,
+            with_texture_baking=True,
             with_layout_postprocess=True,
-            use_vertex_color=True,
+            use_vertex_color=False,
             stage1_inference_steps=None,
             pointmap=pointmap,
         )

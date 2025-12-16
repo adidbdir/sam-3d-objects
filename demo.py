@@ -210,6 +210,12 @@ def main() -> None:
             gs.save_ply(ply_path)
             print(f"[OK] Saved PLY -> {ply_path}")
 
+            # Export GLB
+            if "glb" in output and output["glb"] is not None:
+                glb_path = os.path.join(outputs_dir, f"mesh_{base}.glb")
+                output["glb"].export(glb_path)
+                print(f"[OK] Saved GLB -> {glb_path}")
+
             # Optional visualization
             if args.visualize:
                 mp4_path = os.path.join(outputs_dir, f"preview_{base}.mp4")

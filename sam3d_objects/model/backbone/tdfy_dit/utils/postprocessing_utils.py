@@ -18,6 +18,19 @@ from .render_utils import render_multiview
 from ..renderers import GaussianRenderer
 from ..representations import Strivec, Gaussian, MeshExtractResult
 from loguru import logger
+from dataclasses import dataclass
+from typing import Optional
+import os
+from pathlib import Path
+
+
+@dataclass
+class MeshExportData:
+    vertices: np.ndarray  # (V, 3)
+    faces: np.ndarray  # (F, 3)
+    uvs: Optional[np.ndarray] = None  # (V, 2) or (F*3, 2) depending on source
+    texture: Optional[Image.Image] = None  # PIL image if baked
+    vertex_colors: Optional[np.ndarray] = None  # (V, 3) in [0, 1]
 
 @torch.no_grad()
 def _fill_holes(
@@ -594,90 +607,111 @@ def to_glb(
     with_mesh_postprocess=True,
     with_texture_baking=True,
     use_vertex_color=False,
-    rendering_engine: str = "nvdiffrast",  # nvdiffrast OR "pytorch3d"
-) -> trimesh.Trimesh:
-    """
-    Convert a generated asset to a glb file.
-
-    Args:
-        app_rep (Union[Strivec, Gaussian]): Appearance representation.
-        mesh (MeshExtractResult): Extracted mesh.
-        simplify (float): Ratio of faces to remove in simplification.
-        fill_holes (bool): Whether to fill holes in the mesh.
-        fill_holes_max_size (float): Maximum area of a hole to fill.
-        texture_size (int): Size of the texture.
-        debug (bool): Whether to print debug information.
-        verbose (bool): Whether to print progress.
-    """
+    rendering_engine: str = "nvdiffrast", # Varsayilan bu ama asagida ezecegiz
+    return_export_data: bool = False,
+) -> Union[trimesh.Trimesh, tuple[trimesh.Trimesh, MeshExportData]]:
+    
+    # --- KRITIK MUDAHALE: MOTORU ZORLA ---
+    # Kodun baska yerinden ne gelirse gelsin, burada Nvdiffrast calisacak.
+    rendering_engine = "nvdiffrast"
+    print(f"\n--- [TO_GLB] Motor Zorlandi: {rendering_engine} ---")
+    
+    # 1. Verileri Cek
     vertices = mesh.vertices.float().cpu().numpy()
     faces = mesh.faces.cpu().numpy()
-    vert_colors = mesh.vertex_attrs[:, :3].cpu().numpy()
+    vert_colors = None
+    try:
+        if mesh.vertex_attrs is not None:
+            vert_colors = mesh.vertex_attrs[:, :3].cpu().numpy()
+    except: pass
 
+    # 2. Mesh Islemleri
     if with_mesh_postprocess:
-        # mesh postprocess
-        vertices, faces = postprocess_mesh(
-            vertices,
-            faces,
-            simplify=simplify > 0,
-            simplify_ratio=simplify,
-            fill_holes=fill_holes,
-            fill_holes_max_hole_size=fill_holes_max_size,
-            fill_holes_max_hole_nbe=int(250 * np.sqrt(1 - simplify)),
-            fill_holes_resolution=1024,
-            fill_holes_num_views=1000,
-            debug=debug,
-            verbose=verbose,
-        )
+        print("-> Mesh Post-Processing...")
+        effective_fill_holes = fill_holes # Nvdiffrast oldugu icin True kalabilir
+        try:
+            vertices, faces = postprocess_mesh(
+                vertices, faces,
+                simplify=simplify > 0, simplify_ratio=simplify,
+                fill_holes=effective_fill_holes,
+                fill_holes_max_hole_size=fill_holes_max_size,
+                fill_holes_max_hole_nbe=int(250 * np.sqrt(1 - simplify)),
+                fill_holes_resolution=1024, fill_holes_num_views=1000,
+                debug=debug, verbose=verbose,
+            )
+        except Exception as e:
+            print(f"[HATA] Mesh Post-Process: {e}")
 
+    # 3. TEXTURE BAKING
+    baked_texture = None
+    uvs = None
+    
     if with_texture_baking:
-        # parametrize mesh
-        vertices, faces, uvs = parametrize_mesh(vertices, faces)
-        logger.info("Baking texture ...")
+        print(f"-> Texture Baking basliyor ({rendering_engine})...")
+        try:
+            vertices, faces, uvs = parametrize_mesh(vertices, faces)
+            
+            # Rendering
+            observations, extrinsics, intrinsics = render_multiview(
+                app_rep, resolution=1024, nviews=100
+            )
+            masks = [np.any(observation > 0, axis=-1) for observation in observations]
+            extrinsics = [extrinsics[i].cpu().numpy() for i in range(len(extrinsics))]
+            intrinsics = [intrinsics[i].cpu().numpy() for i in range(len(intrinsics))]
+            
+            # Texture Optimizasyonu
+            texture = bake_texture(
+                vertices, faces, uvs,
+                observations, masks, extrinsics, intrinsics,
+                texture_size=texture_size,
+                mode="opt", lambda_tv=0.01, verbose=verbose,
+                rendering_engine=rendering_engine
+            )
+            
+            if texture is not None:
+                # --- NATURAL MODE (DOGAL RENKLER) ---
+                # Nvdiffrast zaten dogru renkleri veriyor.
+                # Hicbir filtre uygulamadan dogrudan kaydediyoruz.
+                
+                # Sadece float -> uint8 donusumu (Zorunlu)
+                # (Clip islemi guvenlik icindir)
+                texture = np.clip(texture, 0, 255).astype(np.uint8)
+                
+                baked_texture = Image.fromarray(texture)
+                print("-> Texture (Dogal) Hazirlandi.")
 
-        # bake texture
-        observations, extrinsics, intrinsics = render_multiview(
-            app_rep, resolution=1024, nviews=100
-        )
-        masks = [np.any(observation > 0, axis=-1) for observation in observations]
-        extrinsics = [extrinsics[i].cpu().numpy() for i in range(len(extrinsics))]
-        intrinsics = [intrinsics[i].cpu().numpy() for i in range(len(intrinsics))]
-        texture = bake_texture(
-            vertices,
-            faces,
-            uvs,
-            observations,
-            masks,
-            extrinsics,
-            intrinsics,
-            texture_size=texture_size,
-            mode="opt",
-            lambda_tv=0.01,
-            verbose=verbose,
-            rendering_engine=rendering_engine
-        )
-        texture = Image.fromarray(texture)
-        material = trimesh.visual.material.PBRMaterial(
-            roughnessFactor=1.0,
-            baseColorTexture=texture,
-            baseColorFactor=np.array([255, 255, 255, 255], dtype=np.uint8),
-        )
+        except Exception as e:
+            print(f"[KRITIK HATA] Texture Baking: {e}")
 
-    # rotate mesh (from z-up to y-up)
+    # 4. Mesh Birlestirme
     vertices = vertices @ np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
-
-    if not with_mesh_postprocess and not with_texture_baking and use_vertex_color:
-        mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-        mesh.visual.vertex_colors = vert_colors
-    else:
-        mesh = trimesh.Trimesh(
-            vertices,
-            faces,
-            visual=(
-                trimesh.visual.TextureVisuals(uv=uvs, material=material)
-                if with_texture_baking
-                else None
-            ),
+    
+    mat = None
+    if baked_texture is not None:
+        mat = trimesh.visual.material.PBRMaterial(
+            roughnessFactor=1.0,
+            metallicFactor=0.0, 
+            baseColorTexture=baked_texture,
+            baseColorFactor=np.array([255, 255, 255, 255], dtype=np.uint8),
+            doubleSided=True
         )
+
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+    if baked_texture is not None:
+        mesh.visual = trimesh.visual.TextureVisuals(uv=uvs, material=mat)
+    elif use_vertex_color and vert_colors is not None:
+        if len(vert_colors) == len(vertices):
+            mesh.visual.vertex_colors = vert_colors
+
+    if return_export_data:
+        export_data = MeshExportData(
+            vertices=vertices, faces=faces,
+            uvs=uvs if baked_texture is not None else None,
+            texture=baked_texture,
+            vertex_colors=vert_colors if use_vertex_color else None,
+        )
+        return mesh, export_data
 
     return mesh
 
@@ -833,3 +867,157 @@ def simplify_gs(
     new_gs._opacity = new_gs._opacity.data
 
     return new_gs
+
+
+def _require_usd():
+    try:
+        from pxr import Usd, UsdGeom, Sdf, Gf, Vt
+        return Usd, UsdGeom, Sdf, Gf, Vt
+    except ImportError:
+        logger.error("pxr (USD) library not found. Install with: pip install usd-core")
+        return None, None, None, None, None
+
+
+def to_usd(
+    export_data: MeshExportData,
+    output_path: str,
+    verbose: bool = True
+) -> bool:
+    """
+    Export mesh data to USD format (.usda or .usdc)
+    """
+    Usd, UsdGeom, Sdf, Gf, Vt = _require_usd()
+    if Usd is None:
+        return False
+
+    if verbose:
+        logger.info(f"Exporting USD to {output_path}...")
+
+    stage = Usd.Stage.CreateNew(output_path)
+    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.y)
+    UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+
+    # Create root Xform
+    root_path = "/Root"
+    root_prim = UsdGeom.Xform.Define(stage, root_path)
+    stage.SetDefaultPrim(root_prim.GetPrim())
+
+    # Create Mesh
+    mesh_path = f"{root_path}/Mesh"
+    usd_mesh = UsdGeom.Mesh.Define(stage, mesh_path)
+
+    # Set vertices
+    points = export_data.vertices
+    usd_mesh.CreatePointsAttr(points)
+
+    # Set faces (vertex counts and indices)
+    face_vertex_counts = [3] * len(export_data.faces)
+    face_vertex_indices = export_data.faces.flatten()
+    
+    usd_mesh.CreateFaceVertexCountsAttr(face_vertex_counts)
+    usd_mesh.CreateFaceVertexIndicesAttr(face_vertex_indices)
+
+    # Set UVs if available
+    if export_data.uvs is not None:
+        primvar_api = UsdGeom.PrimvarsAPI(usd_mesh)
+        uv_primvar = primvar_api.CreatePrimvar(
+            "st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.faceVarying
+        )
+        # UVs might be per-vertex or per-face-vertex
+        # If per-vertex, we need to map them to face-varying for USD if we want to be safe,
+        # or just set them as vertex interpolation.
+        # But xatlas usually gives us a separate UV array that matches the vertices if we re-indexed,
+        # OR it gives us UVs that match the face corners.
+        # In parametrize_mesh, we did: vertices = vertices[vmapping], faces = indices
+        # So vertices and UVs should be 1:1 if xatlas did its job for a watertight mesh,
+        # but usually xatlas splits vertices.
+        # Let's assume UVs correspond to vertices 1:1.
+        uv_primvar.Set(export_data.uvs)
+        uv_primvar.SetInterpolation(UsdGeom.Tokens.vertex)
+
+    # Set Material if texture is available
+    if export_data.texture is not None:
+        # Save texture to a file next to the USD
+        tex_filename = Path(output_path).stem + "_albedo.png"
+        tex_path = Path(output_path).parent / tex_filename
+        export_data.texture.save(tex_path)
+        
+        # Create Material
+        material_path = f"{root_path}/Material"
+        material = UsdShade.Material.Define(stage, material_path)
+        pbr_shader = UsdShade.Shader.Define(stage, f"{material_path}/PBRShader")
+        pbr_shader.CreateIdAttr("UsdPreviewSurface")
+        
+        # Connect Material to Shader
+        material.CreateSurfaceOutput().ConnectToSource(pbr_shader.ConnectableAPI(), "surface")
+
+        # Create Texture Sampler
+        st_reader = UsdShade.Shader.Define(stage, f"{material_path}/stReader")
+        st_reader.CreateIdAttr("UsdPrimvarReader_float2")
+        st_reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
+
+        diffuse_texture = UsdShade.Shader.Define(stage, f"{material_path}/DiffuseTexture")
+        diffuse_texture.CreateIdAttr("UsdUVTexture")
+        diffuse_texture.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(str(tex_filename))
+        diffuse_texture.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(st_reader.ConnectableAPI(), "result")
+        
+        # Connect Texture to PBR Shader
+        pbr_shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(diffuse_texture.ConnectableAPI(), "rgb")
+        
+        # Bind Material to Mesh
+        UsdShade.MaterialBindingAPI(usd_mesh).Bind(material)
+
+    elif export_data.vertex_colors is not None:
+        # Set Vertex Colors
+        display_color_primvar = usd_mesh.CreateDisplayColorAttr()
+        display_color_primvar.Set(export_data.vertex_colors)
+        # Assuming vertex colors are 1:1 with vertices
+        # usd_mesh.SetInterpolation(UsdGeom.Tokens.vertex) # DisplayColor doesn't have explicit interpolation setter on the attr, it's implicit?
+        # Actually for Primvars:
+        primvar_api = UsdGeom.PrimvarsAPI(usd_mesh)
+        color_primvar = primvar_api.CreatePrimvar(
+            "displayColor", Sdf.ValueTypeNames.Color3fArray, UsdGeom.Tokens.vertex
+        )
+        color_primvar.Set(export_data.vertex_colors)
+
+    stage.GetRootLayer().Save()
+    return True
+
+
+def to_usdz(
+    export_data: MeshExportData,
+    output_path: str,
+    verbose: bool = True
+) -> bool:
+    """
+    Export mesh data to USDZ format (zipped USD)
+    """
+    try:
+        from pxr import Usd, UsdGeom, Sdf
+    except ImportError:
+        logger.error("pxr (USD) library not found.")
+        return False
+
+    # Create a temporary directory for the USDA/USDC and texture
+    import tempfile
+    import shutil
+    import zipfile
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        usd_filename = Path(output_path).stem + ".usdc"
+        usd_path = tmp_path / usd_filename
+        
+        success = to_usd(export_data, str(usd_path), verbose=verbose)
+        if not success:
+            return False
+            
+        # Zip it up
+        if verbose:
+            logger.info(f"Packaging USDZ to {output_path}...")
+            
+        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_STORED) as zf:
+            for file_path in tmp_path.glob("*"):
+                zf.write(file_path, arcname=file_path.name)
+                
+    return True
